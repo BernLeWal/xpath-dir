@@ -1,0 +1,1569 @@
+#!/usr/bin/env bash
+#
+# xpath-dir — Query file directory structures using XPath-like syntax
+#
+# Usage: xpath-dir <query-string>
+#
+
+# ---------------------------------------------------------------------------
+# Bash version check (Requirement 12.1: bash 4.0+ for associative arrays)
+# ---------------------------------------------------------------------------
+if [[ -z "${BASH_VERSINFO[0]}" ]] || (( BASH_VERSINFO[0] < 4 )); then
+    echo "Error: xpath-dir requires bash 4.0 or higher (found ${BASH_VERSION:-unknown})" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Dependency check (Requirement 12.2: ls, awk, sed, grep, bc, find)
+# ---------------------------------------------------------------------------
+for cmd in ls awk sed grep bc find; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "Error: required command '$cmd' not found" >&2
+        exit 1
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# Argument validation — exactly one argument required
+# ---------------------------------------------------------------------------
+if [[ $# -ne 1 ]]; then
+    echo "Usage: xpath-dir <query-string>" >&2
+    exit 1
+fi
+
+QUERY_STRING="$1"
+
+# ---------------------------------------------------------------------------
+# Global AST data structures (populated by the parser)
+# ---------------------------------------------------------------------------
+declare -A STEPS          # STEPS[i]      = step name (e.g. "static", "*", "node()")
+declare -A STEP_AXES      # STEP_AXES[i]  = axis ("child"|"descendant"|"parent"|"self"|"attribute")
+declare -A PREDICATES     # PREDICATES[i] = predicate expression (empty string if none)
+declare    QUERY_TYPE=""  # "absolute" | "relative"
+declare -A UNION_QUERIES  # UNION_QUERIES[i] = sub-query string (for | operator)
+declare    UNION_COUNT=0  # number of union sub-queries
+declare    STEP_COUNT=0   # total number of steps in current (sub-)query
+
+# ---------------------------------------------------------------------------
+# Global node-cache data structures (populated by the file system adapter)
+# ---------------------------------------------------------------------------
+declare -A NODE_TYPE         # NODE_TYPE[path]         = "file"|"directory"|"symlink"|"root"
+declare -A NODE_NAME         # NODE_NAME[path]         = basename
+declare -A ATTR_PERMISSIONS  # ATTR_PERMISSIONS[path]  = permission string  (ls col 1)
+declare -A ATTR_ITEM_COUNT   # ATTR_ITEM_COUNT[path]   = hard-link / item count (ls col 2)
+declare -A ATTR_GROUP        # ATTR_GROUP[path]         = group name          (ls col 3)
+declare -A ATTR_USER         # ATTR_USER[path]          = user name           (ls col 4)
+declare -A ATTR_SIZE         # ATTR_SIZE[path]          = size in bytes       (ls col 5)
+declare -A ATTR_DATETIME     # ATTR_DATETIME[path]      = modification date   (ls cols 6-8)
+declare -A ATTR_NAME         # ATTR_NAME[path]          = file/directory name (ls col 9)
+declare -A ATTR_LINK_TARGET  # ATTR_LINK_TARGET[path]   = symlink target (empty if not symlink)
+
+# ===========================================================================
+# Component placeholders — will be implemented in subsequent tasks
+# ===========================================================================
+
+# --- Query Parser (Task 2) ---
+# parse_query(query_string)
+#   Parses an XPath-like query string into the global AST arrays.
+#   Handles union operator |, absolute/relative classification, axis detection,
+#   predicate extraction, wildcard recognition, and syntax validation.
+#
+#   Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 1.10, 1.11
+parse_query() {
+    local query="$1"
+
+    # --- Validate: empty query ---
+    if [[ -z "$query" ]]; then
+        echo "Error: empty query string" >&2
+        exit 1
+    fi
+
+    # --- Handle union operator | (Req 1.9) ---
+    # Split on | that is NOT inside [...] brackets
+    UNION_COUNT=0
+    local depth=0 current="" i char
+    for (( i=0; i<${#query}; i++ )); do
+        char="${query:$i:1}"
+        if [[ "$char" == "[" ]]; then
+            (( depth++ ))
+            current+="$char"
+        elif [[ "$char" == "]" ]]; then
+            (( depth-- ))
+            current+="$char"
+        elif [[ "$char" == "|" && $depth -eq 0 ]]; then
+            # Trim whitespace from sub-query
+            current="$(echo "$current" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            if [[ -z "$current" ]]; then
+                echo "Error: empty sub-query in union expression" >&2
+                exit 1
+            fi
+            UNION_QUERIES[$UNION_COUNT]="$current"
+            (( UNION_COUNT++ ))
+            current=""
+        else
+            current+="$char"
+        fi
+    done
+    # Add the last sub-query
+    current="$(echo "$current" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ -z "$current" ]]; then
+        echo "Error: empty sub-query in union expression" >&2
+        exit 1
+    fi
+    UNION_QUERIES[$UNION_COUNT]="$current"
+    (( UNION_COUNT++ ))
+
+    # If there's only one sub-query (no union), parse it directly.
+    # If there are multiple, we parse the first one now; the evaluator
+    # will call parse_query() again for each sub-query.
+    local to_parse="${UNION_QUERIES[0]}"
+
+    _parse_single_query "$to_parse"
+}
+
+# _parse_single_query(query_string)
+#   Internal helper: parses a single (non-union) query into the AST arrays.
+_parse_single_query() {
+    local query="$1"
+
+    # Reset AST arrays for this sub-query
+    STEPS=()
+    STEP_AXES=()
+    PREDICATES=()
+    STEP_COUNT=0
+
+    # --- Validate: unmatched brackets (Req 1.11) ---
+    local bracket_depth=0 ci
+    for (( ci=0; ci<${#query}; ci++ )); do
+        local ch="${query:$ci:1}"
+        if [[ "$ch" == "[" ]]; then
+            (( bracket_depth++ ))
+        elif [[ "$ch" == "]" ]]; then
+            (( bracket_depth-- ))
+            if (( bracket_depth < 0 )); then
+                echo "Error: unmatched ']' in query: $query" >&2
+                exit 1
+            fi
+        fi
+    done
+    if (( bracket_depth != 0 )); then
+        echo "Error: unmatched '[' in query: $query" >&2
+        exit 1
+    fi
+
+    # --- Classify query type (Req 1.3, 1.4) ---
+    if [[ "$query" == /* ]]; then
+        QUERY_TYPE="absolute"
+    else
+        QUERY_TYPE="relative"
+    fi
+
+    # --- Tokenize into raw steps, respecting // vs / (Req 1.1, 1.7) ---
+    # Strategy: walk the query character by character, splitting on / and //
+    # while skipping over [...] predicate content.
+    local tokens=()       # raw step strings (may include predicates)
+    local axes=()         # axis for each token
+    local buf=""
+    local in_bracket=0
+    local idx=0
+    local qlen=${#query}
+
+    # If absolute, skip the leading /
+    if [[ "$QUERY_TYPE" == "absolute" ]]; then
+        if (( qlen >= 2 )) && [[ "${query:0:2}" == "//" ]]; then
+            # Query starts with // — first step gets descendant axis
+            axes+=("descendant")
+            idx=2
+        else
+            # Query starts with / — skip it; first step gets child axis
+            idx=1
+        fi
+    fi
+
+    while (( idx < qlen )); do
+        local c="${query:$idx:1}"
+
+        if [[ "$c" == "[" ]]; then
+            (( in_bracket++ ))
+            buf+="$c"
+            (( idx++ ))
+        elif [[ "$c" == "]" ]]; then
+            (( in_bracket-- ))
+            buf+="$c"
+            (( idx++ ))
+        elif [[ "$c" == "/" && $in_bracket -eq 0 ]]; then
+            # End of current token
+            if [[ -n "$buf" ]]; then
+                tokens+=("$buf")
+                # If no axis was pre-assigned for this token, default to child
+                if (( ${#axes[@]} < ${#tokens[@]} )); then
+                    axes+=("child")
+                fi
+                buf=""
+            fi
+            # Check for //
+            if (( idx + 1 < qlen )) && [[ "${query:$((idx+1)):1}" == "/" ]]; then
+                axes+=("descendant")
+                (( idx += 2 ))
+            else
+                (( idx++ ))
+            fi
+        else
+            buf+="$c"
+            (( idx++ ))
+        fi
+    done
+
+    # Flush remaining buffer
+    if [[ -n "$buf" ]]; then
+        tokens+=("$buf")
+        if (( ${#axes[@]} < ${#tokens[@]} )); then
+            axes+=("child")
+        fi
+    fi
+
+    # --- Validate: no empty steps (Req 1.11) ---
+    if (( ${#tokens[@]} == 0 )) && [[ "$query" != "/" ]]; then
+        echo "Error: query has no valid path steps: $query" >&2
+        exit 1
+    fi
+
+    # Handle the bare "/" query — it refers to root itself
+    if (( ${#tokens[@]} == 0 )) && [[ "$query" == "/" ]]; then
+        STEPS[0]=""
+        STEP_AXES[0]="child"
+        PREDICATES[0]=""
+        STEP_COUNT=1
+        return
+    fi
+
+    # --- Process each token: extract predicates, assign axes, validate ---
+    local ti
+    for (( ti=0; ti<${#tokens[@]}; ti++ )); do
+        local raw="${tokens[$ti]}"
+        local axis="${axes[$ti]}"
+
+        # --- Extract predicate from [...] at end of step (Req 1.2) ---
+        local step_name=""
+        local predicate=""
+
+        # Find the first '[' that is not inside a nested bracket
+        local pred_start=-1 bd=0 si
+        for (( si=0; si<${#raw}; si++ )); do
+            local sc="${raw:$si:1}"
+            if [[ "$sc" == "[" ]]; then
+                if (( bd == 0 )); then
+                    pred_start=$si
+                fi
+                (( bd++ ))
+            elif [[ "$sc" == "]" ]]; then
+                (( bd-- ))
+            fi
+        done
+
+        if (( pred_start >= 0 )); then
+            step_name="${raw:0:$pred_start}"
+            # Extract predicate content (without outer brackets)
+            local pred_with_brackets="${raw:$pred_start}"
+            # Remove leading [ and trailing ]
+            predicate="${pred_with_brackets:1:${#pred_with_brackets}-2}"
+        else
+            step_name="$raw"
+            predicate=""
+        fi
+
+        # Trim whitespace from step name
+        step_name="$(echo "$step_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+        # --- Validate: empty step name (Req 1.11) ---
+        if [[ -z "$step_name" && -z "$predicate" ]]; then
+            echo "Error: empty step in query: $query" >&2
+            exit 1
+        fi
+
+        # --- Assign special axes (Req 1.5, 1.6, 1.8) ---
+        if [[ "$step_name" == ".." ]]; then
+            axis="parent"
+        elif [[ "$step_name" == "." ]]; then
+            axis="self"
+        elif [[ "$step_name" == @* ]]; then
+            axis="attribute"
+            # Strip the @ prefix from the step name for storage
+            step_name="${step_name:1}"
+        fi
+
+        # --- Validate wildcards (Req 1.10) ---
+        # Valid step names: alphanumeric with hyphens/underscores/dots,
+        # wildcards *, node(), or empty (for attribute axis with @*)
+        # We allow these through; anything else with invalid chars is an error.
+        if [[ -n "$step_name" ]]; then
+            case "$step_name" in
+                "."|".."|\
+                "*"|"node()") ;;  # valid special steps
+                *)
+                    # Allow alphanumeric, hyphens, underscores, dots, tildes
+                    if [[ ! "$step_name" =~ ^[a-zA-Z0-9_.*?~/-]+$ ]]; then
+                        echo "Error: invalid characters in step '$step_name' in query: $query" >&2
+                        exit 1
+                    fi
+                    ;;
+            esac
+        fi
+
+        # Store in AST arrays
+        STEPS[$STEP_COUNT]="$step_name"
+        STEP_AXES[$STEP_COUNT]="$axis"
+        PREDICATES[$STEP_COUNT]="$predicate"
+        (( STEP_COUNT++ ))
+    done
+}
+
+# --- Input Sanitization (Task 1.2) ---
+# sanitize_input(query_string)
+#   Strips dangerous shell injection characters from the query string while
+#   preserving characters valid in XPath syntax for internal parsing.
+#
+#   Shell-dangerous characters removed: ; & ` $
+#   XPath operators < > are kept in the parsed AST but must be quoted/escaped
+#   by each component before passing to shell commands (ls, find, locate).
+#
+#   Requirements: 11.1, 11.2
+sanitize_input() {
+    local input="$1"
+    local sanitized="$input"
+
+    # Strip backticks — prevent command substitution via `...`
+    sanitized="${sanitized//\`/}"
+    # Strip semicolons — prevent command chaining via ;
+    sanitized="${sanitized//;/}"
+    # Strip ampersands — prevent background execution / logical &&
+    sanitized="${sanitized//&/}"
+    # Strip dollar signs — neutralise $(...) and $VAR expansions
+    sanitized="${sanitized//\$/}"
+
+    printf '%s' "$sanitized"
+}
+
+# sanitize_for_shell(value)
+#   Escapes a value so it is safe to embed in shell commands (ls, find, etc.).
+#   This is the second layer of defence: even after sanitize_input() cleans the
+#   query string, individual values extracted during evaluation (file names,
+#   attribute values) must go through this before being interpolated into any
+#   command string.
+#
+#   Requirements: 11.1, 11.2
+sanitize_for_shell() {
+    local val="$1"
+    # Use printf %q to produce a shell-escaped version of the value.
+    # This handles spaces, quotes, <, >, (, ), and any other special chars.
+    printf '%q' "$val"
+}
+
+# --- File System Adapter (Task 3) ---
+
+# normalize_path(path) -> outputs absolute path with no relative components
+#   Resolves ., .., ~ to produce a clean absolute path.
+#   Requirements: 2.8
+normalize_path() {
+    local p="$1"
+
+    # Expand ~ to $HOME
+    if [[ "$p" == "~" ]]; then
+        p="$HOME"
+    elif [[ "$p" == "~/"* ]]; then
+        p="$HOME/${p:2}"
+    fi
+
+    # Make relative paths absolute
+    if [[ "$p" != /* ]]; then
+        p="$PWD/$p"
+    fi
+
+    # Resolve . and .. components manually (no readlink -f to avoid resolving symlinks)
+    local -a parts=()
+    local IFS='/'
+    local segment
+    for segment in $p; do
+        if [[ -z "$segment" || "$segment" == "." ]]; then
+            continue
+        elif [[ "$segment" == ".." ]]; then
+            if (( ${#parts[@]} > 0 )); then
+                unset 'parts[${#parts[@]}-1]'
+            fi
+        else
+            parts+=("$segment")
+        fi
+    done
+
+    local result="/"
+    if (( ${#parts[@]} > 0 )); then
+        result="/${parts[*]}"
+        # IFS is / so join with /
+    fi
+    printf '%s' "$result"
+}
+
+# resolve_node(path) -> outputs node type: "file", "directory", "symlink", or "not_found"
+#   Also normalizes the path and detects symlink cycles.
+#   Requirements: 2.8, 11.3, 11.4
+resolve_node() {
+    local raw_path="$1"
+    local norm
+    norm="$(normalize_path "$raw_path")"
+
+    if [[ ! -e "$norm" && ! -L "$norm" ]]; then
+        echo "not_found"
+        return
+    fi
+
+    if [[ -L "$norm" ]]; then
+        # Detect symlink cycles: follow up to 40 hops (POSIX SYMLOOP_MAX)
+        local target="$norm"
+        local -A seen_links=()
+        local hops=0
+        while [[ -L "$target" ]]; do
+            if [[ -n "${seen_links[$target]+x}" ]]; then
+                echo "Error: symlink cycle detected at $target" >&2
+                echo "symlink"
+                return
+            fi
+            seen_links["$target"]=1
+            (( hops++ ))
+            if (( hops > 40 )); then
+                echo "Error: too many levels of symlinks at $target" >&2
+                echo "symlink"
+                return
+            fi
+            local link_dest
+            link_dest="$(readlink "$target" 2>/dev/null)"
+            # If link_dest is relative, resolve against the directory containing the link
+            if [[ "$link_dest" != /* ]]; then
+                link_dest="$(dirname "$target")/$link_dest"
+            fi
+            target="$(normalize_path "$link_dest")"
+        done
+        echo "symlink"
+        return
+    fi
+
+    if [[ -d "$norm" ]]; then
+        echo "directory"
+    else
+        echo "file"
+    fi
+}
+
+# get_attributes(path)
+#   Parses ls -al output for a single node and populates the global cache arrays.
+#   Requirements: 2.4, 2.5, 2.6, 2.7, 8.1-8.8
+get_attributes() {
+    local node_path="$1"
+    local norm
+    norm="$(normalize_path "$node_path")"
+
+    # Skip if already cached
+    if [[ -n "${ATTR_PERMISSIONS[$norm]+x}" ]]; then
+        return
+    fi
+
+    local parent_dir
+    parent_dir="$(dirname "$norm")"
+    local base
+    base="$(basename "$norm")"
+
+    # Use ls -ald on the node itself to get its attributes
+    local ls_line
+    ls_line="$(ls -ald -- "$norm" 2>/dev/null)" || {
+        echo "Warning: cannot access '$norm'" >&2
+        return 1
+    }
+
+    _parse_ls_line "$norm" "$ls_line"
+
+    # When using ls -ald, the name field contains the full path.
+    # Override ATTR_NAME with the basename for consistency with @name semantics.
+    ATTR_NAME["$norm"]="$base"
+    NODE_NAME["$norm"]="$base"
+}
+
+# _parse_ls_line(node_path, ls_line)
+#   Internal helper: parses a single ls -al output line into attribute arrays.
+_parse_ls_line() {
+    local node_path="$1"
+    local line="$2"
+
+    # Skip empty lines and summary lines (e.g. "total 123" or locale variants)
+    [[ -z "$line" ]] && return
+    [[ "$line" =~ ^[a-zA-Z]+[[:space:]]+[0-9] ]] && [[ ! "$line" =~ ^[dlcbps\-] ]] && return
+
+    # Parse using awk — handles both datetime formats:
+    #   Mon DD HH:MM   (6 fields before name)
+    #   Mon DD  YYYY   (6 fields before name)
+    # Fields: permissions(1) item_count(2) group(3) user(4) size(5) month(6) day(7) time_or_year(8) name(9+)
+    local perms item_count group_name user_name size_val month day time_or_year name_field
+
+    perms="$(echo "$line" | awk '{print $1}')"
+    item_count="$(echo "$line" | awk '{print $2}')"
+    group_name="$(echo "$line" | awk '{print $3}')"
+    user_name="$(echo "$line" | awk '{print $4}')"
+    size_val="$(echo "$line" | awk '{print $5}')"
+    month="$(echo "$line" | awk '{print $6}')"
+    day="$(echo "$line" | awk '{print $7}')"
+    time_or_year="$(echo "$line" | awk '{print $8}')"
+
+    # Name is everything from field 9 onward (handles spaces in names)
+    name_field="$(echo "$line" | awk '{for(i=9;i<=NF;i++) printf "%s%s", (i>9?" ":""), $i; print ""}')"
+
+    local datetime="${month} ${day} ${time_or_year}"
+
+    # Derive @type from first character of permissions (Req 8.8)
+    local node_type
+    case "${perms:0:1}" in
+        d) node_type="directory" ;;
+        l) node_type="symlink" ;;
+        *) node_type="file" ;;
+    esac
+
+    # Handle symlink: extract link target from "name -> target" (Req 2.5)
+    local link_target=""
+    local display_name="$name_field"
+    if [[ "$node_type" == "symlink" && "$name_field" == *" -> "* ]]; then
+        display_name="${name_field%% -> *}"
+        link_target="${name_field#* -> }"
+    fi
+
+    # Populate cache arrays
+    ATTR_PERMISSIONS["$node_path"]="$perms"
+    ATTR_ITEM_COUNT["$node_path"]="$item_count"
+    ATTR_GROUP["$node_path"]="$group_name"
+    ATTR_USER["$node_path"]="$user_name"
+    ATTR_SIZE["$node_path"]="$size_val"
+    ATTR_DATETIME["$node_path"]="$datetime"
+    ATTR_NAME["$node_path"]="$display_name"
+    ATTR_LINK_TARGET["$node_path"]="$link_target"
+    NODE_TYPE["$node_path"]="$node_type"
+    NODE_NAME["$node_path"]="$display_name"
+}
+
+# list_children(dir_path) -> outputs child paths, one per line
+#   Executes ls -al on the directory, parses output, populates cache, skips . and ..
+#   Requirements: 2.1, 2.4
+list_children() {
+    local dir_path="$1"
+    local norm
+    norm="$(normalize_path "$dir_path")"
+
+    if [[ ! -d "$norm" ]]; then
+        return
+    fi
+
+    local ls_output
+    ls_output="$(ls -al -- "$norm" 2>/dev/null)" || {
+        echo "Warning: permission denied reading '$norm'" >&2
+        return
+    }
+
+    local line
+    while IFS= read -r line; do
+        # Skip empty lines and the summary line (e.g. "total 123" or locale variants like "insgesamt 123")
+        [[ -z "$line" ]] && continue
+        [[ "$line" =~ ^[a-zA-Z]+[[:space:]]+[0-9] ]] && [[ ! "$line" =~ ^[dlcbps\-] ]] && continue
+
+        # Extract name (field 9+)
+        local entry_name
+        entry_name="$(echo "$line" | awk '{for(i=9;i<=NF;i++) printf "%s%s", (i>9?" ":""), $i; print ""}')"
+
+        # Handle symlink names (strip " -> target" for path construction)
+        local clean_name="$entry_name"
+        if [[ "$entry_name" == *" -> "* ]]; then
+            clean_name="${entry_name%% -> *}"
+        fi
+
+        # Skip . and ..
+        [[ "$clean_name" == "." || "$clean_name" == ".." ]] && continue
+
+        local child_path
+        if [[ "$norm" == "/" ]]; then
+            child_path="/${clean_name}"
+        else
+            child_path="${norm}/${clean_name}"
+        fi
+
+        # Parse attributes into cache
+        _parse_ls_line "$child_path" "$line"
+
+        # Output the child path
+        echo "$child_path"
+    done <<< "$ls_output"
+}
+
+# search_descendants(pattern, base_path) -> outputs matching absolute paths, one per line
+#   Uses locate for speed; falls back to find if locate is unavailable.
+#   Requirements: 2.2, 2.3, 12.3, 12.4
+search_descendants() {
+    local pattern="$1"
+    local base_path="$2"
+    local norm
+    norm="$(normalize_path "$base_path")"
+
+    if command -v locate &>/dev/null; then
+        # Use locate and filter to paths under base_path
+        local locate_results
+        locate_results="$(locate -i -- "$pattern" 2>/dev/null)" || true
+
+        if [[ -n "$locate_results" ]]; then
+            local lpath
+            while IFS= read -r lpath; do
+                # Only include paths that are under the base path
+                if [[ "$lpath" == "${norm}/"* ]]; then
+                    # Filter by pattern matching on basename
+                    local lbase
+                    lbase="$(basename "$lpath")"
+                    if [[ "$pattern" == "*" ]] || _name_matches "$lbase" "$pattern"; then
+                        echo "$lpath"
+                    fi
+                fi
+            done <<< "$locate_results"
+        fi
+    else
+        echo "Warning: 'locate' not available, falling back to 'find' (may be slower)" >&2
+        # Use find as fallback
+        if [[ "$pattern" == "*" ]]; then
+            find "$norm" -mindepth 1 2>/dev/null
+        else
+            find "$norm" -mindepth 1 -name "$pattern" 2>/dev/null
+        fi
+    fi
+}
+
+# _name_matches(name, pattern) -> returns 0 if name matches the pattern
+#   Simple glob-style matching helper for search_descendants filtering.
+_name_matches() {
+    local name="$1"
+    local pat="$2"
+
+    # Use bash pattern matching (extglob not needed for simple globs)
+    # shellcheck disable=SC2254
+    case "$name" in
+        $pat) return 0 ;;
+        *)    return 1 ;;
+    esac
+}
+
+# --- Operator Engine (Task 5) ---
+# eval_operator(left, op, right) -> outputs result
+#   Evaluates arithmetic, comparison, and logical operators.
+#   Delegates to awk/bc for numeric work, bash [[ ]] for string comparisons.
+#   Requirements: 5.1, 5.2, 5.3, 5.4, 5.5
+
+# _is_numeric(value) -> returns 0 if value is a number (integer or decimal)
+_is_numeric() {
+    local val="$1"
+    [[ "$val" =~ ^-?[0-9]+\.?[0-9]*$ ]]
+}
+
+eval_operator() {
+    local left="$1"
+    local op="$2"
+    local right="$3"
+
+    case "$op" in
+        # --- Arithmetic operators (Req 5.1) ---
+        +|-|div|mod)
+            local awk_op="$op"
+            [[ "$op" == "div" ]] && awk_op="/"
+            [[ "$op" == "mod" ]] && awk_op="%"
+            LC_NUMERIC=C awk "BEGIN { printf \"%.10g\", ($left) $awk_op ($right) }"
+            ;;
+        # Multiplication — handled separately because * is a glob character
+        '*')
+            LC_NUMERIC=C awk "BEGIN { printf \"%.10g\", ($left) * ($right) }"
+            ;;
+
+        # --- Comparison operators (Req 5.2, 5.4, 5.5) ---
+        '='|'!='|'<'|'<='|'>'|'>=')
+            if _is_numeric "$left" && _is_numeric "$right"; then
+                # Numeric comparison via awk
+                local awk_cmp="$op"
+                [[ "$op" == "=" ]] && awk_cmp="=="
+                LC_NUMERIC=C awk "BEGIN { print (($left) $awk_cmp ($right)) ? \"true\" : \"false\" }"
+            else
+                # String comparison via bash [[ ]]
+                local res="false"
+                case "$op" in
+                    '=')  [[ "$left" == "$right" ]] && res="true" ;;
+                    '!=') [[ "$left" != "$right" ]] && res="true" ;;
+                    '<')  [[ "$left" < "$right" ]]  && res="true" ;;
+                    '<=') [[ "$left" < "$right" || "$left" == "$right" ]] && res="true" ;;
+                    '>')  [[ "$left" > "$right" ]]  && res="true" ;;
+                    '>=') [[ "$left" > "$right" || "$left" == "$right" ]] && res="true" ;;
+                esac
+                echo "$res"
+            fi
+            ;;
+
+        # --- Logical operators (Req 5.3) ---
+        'and')
+            if [[ "$left" == "true" && "$right" == "true" ]]; then
+                echo "true"
+            else
+                echo "false"
+            fi
+            ;;
+        'or')
+            if [[ "$left" == "true" || "$right" == "true" ]]; then
+                echo "true"
+            else
+                echo "false"
+            fi
+            ;;
+
+        *)
+            echo "Error: unsupported operator '$op'" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# --- Built-in Functions (Task 6) ---
+# call_function(func_name, context_position, context_total, args...)
+#   Dispatches to the appropriate built-in function implementation.
+#   context_position: 1-based index of the current node in the node set
+#   context_total:    total number of nodes in the current node set
+#   args:             additional arguments (e.g., node set for count())
+#   Requirements: 6.1, 6.6
+call_function() {
+    local func_name="$1"
+    local context_position="$2"
+    local context_total="$3"
+    shift 3  # remaining args are function-specific
+
+    case "$func_name" in
+        position)
+            # position() — returns the 1-based index of the current node (Req 6.1)
+            if [[ $# -gt 0 ]]; then
+                echo "Error: position() takes no arguments" >&2
+                exit 1
+            fi
+            echo "$context_position"
+            ;;
+        last)
+            # last() — returns the total number of nodes in the current set (Req 6.1)
+            if [[ $# -gt 0 ]]; then
+                echo "Error: last() takes no arguments" >&2
+                exit 1
+            fi
+            echo "$context_total"
+            ;;
+        count)
+            # count() — returns the number of nodes in the provided node set (Req 6.1)
+            # Expects a single argument: a newline-separated list of node paths
+            if [[ $# -ne 1 ]]; then
+                echo "Error: count() requires exactly one argument (a node set)" >&2
+                exit 1
+            fi
+            local nodeset="$1"
+            if [[ -z "$nodeset" ]]; then
+                echo "0"
+            else
+                local count
+                count="$(echo "$nodeset" | grep -c .)"
+                echo "$count"
+            fi
+            ;;
+        string-length)
+            # string-length(string) — returns the length of the string (Req 6.2, 6.7)
+            if [[ $# -ne 1 ]]; then
+                echo "Error: string-length() requires exactly one argument" >&2
+                exit 1
+            fi
+            echo "${#1}"
+            ;;
+        contains)
+            # contains(string, substring) — returns "true" if string contains substring (Req 6.2, 6.7)
+            if [[ $# -ne 2 ]]; then
+                echo "Error: contains() requires exactly two arguments" >&2
+                exit 1
+            fi
+            awk -v s="$1" -v t="$2" 'BEGIN { print (index(s, t) > 0) ? "true" : "false" }'
+            ;;
+        starts-with)
+            # starts-with(string, prefix) — returns "true" if string starts with prefix (Req 6.2, 6.7)
+            if [[ $# -ne 2 ]]; then
+                echo "Error: starts-with() requires exactly two arguments" >&2
+                exit 1
+            fi
+            awk -v s="$1" -v p="$2" 'BEGIN { print (index(s, p) == 1) ? "true" : "false" }'
+            ;;
+        substring)
+            # substring(string, start[, length]) — returns substring from 1-based position (Req 6.2, 6.7)
+            if [[ $# -lt 2 || $# -gt 3 ]]; then
+                echo "Error: substring() requires two or three arguments" >&2
+                exit 1
+            fi
+            if [[ $# -eq 2 ]]; then
+                awk -v s="$1" -v st="$2" 'BEGIN { print substr(s, st) }'
+            else
+                awk -v s="$1" -v st="$2" -v ln="$3" 'BEGIN { print substr(s, st, ln) }'
+            fi
+            ;;
+        concat)
+            # concat(string1, string2, ...) — concatenates all arguments (Req 6.2, 6.7)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: concat() requires at least two arguments" >&2
+                exit 1
+            fi
+            local result=""
+            while [[ $# -gt 0 ]]; do
+                result+="$1"
+                shift
+            done
+            echo "$result"
+            ;;
+        normalize-space)
+            # normalize-space(string) — strips leading/trailing whitespace, collapses internal (Req 6.2, 6.7)
+            if [[ $# -ne 1 ]]; then
+                echo "Error: normalize-space() requires exactly one argument" >&2
+                exit 1
+            fi
+            echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/[[:space:]]\{1,\}/ /g'
+            ;;
+
+        # --- Numeric functions (Req 6.3, 6.7) ---
+        sum)
+            # sum(nodeset) — sums numeric values from a newline-separated list
+            if [[ $# -ne 1 ]]; then
+                echo "Error: sum() requires exactly one argument (a node set)" >&2
+                exit 1
+            fi
+            local nodeset="$1"
+            if [[ -z "$nodeset" ]]; then
+                echo "0"
+            else
+                echo "$nodeset" | awk 'BEGIN { s = 0 } { s += $0 } END { printf "%.10g\n", s }'
+            fi
+            ;;
+        floor)
+            # floor(number) — returns largest integer <= number
+            if [[ $# -ne 1 ]]; then
+                echo "Error: floor() requires exactly one argument" >&2
+                exit 1
+            fi
+            LC_NUMERIC=C awk "BEGIN { x = $1; f = int(x); if (f > x) f--; print f }"
+            ;;
+        ceiling)
+            # ceiling(number) — returns smallest integer >= number
+            if [[ $# -ne 1 ]]; then
+                echo "Error: ceiling() requires exactly one argument" >&2
+                exit 1
+            fi
+            LC_NUMERIC=C awk "BEGIN { x = $1; f = int(x); if (f < x) f++; print f }"
+            ;;
+        round)
+            # round(number) — returns nearest integer (standard rounding: half rounds up)
+            if [[ $# -ne 1 ]]; then
+                echo "Error: round() requires exactly one argument" >&2
+                exit 1
+            fi
+            LC_NUMERIC=C awk "BEGIN { x = $1; if (x < 0) print int(x - 0.5); else print int(x + 0.5) }"
+            ;;
+        number)
+            # number(value) — converts value to a number; returns NaN if not convertible
+            if [[ $# -ne 1 ]]; then
+                echo "Error: number() requires exactly one argument" >&2
+                exit 1
+            fi
+            local val="$1"
+            # Trim leading/trailing whitespace
+            val="$(echo "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            if [[ "$val" =~ ^-?[0-9]+\.?[0-9]*$ ]]; then
+                LC_NUMERIC=C awk "BEGIN { printf \"%.10g\n\", $val }"
+            else
+                echo "NaN"
+            fi
+            ;;
+
+        # --- Boolean functions (Req 6.4) ---
+        boolean)
+            # boolean(value) — converts value to boolean
+            if [[ $# -ne 1 ]]; then
+                echo "Error: boolean() requires exactly one argument" >&2
+                exit 1
+            fi
+            local bval="$1"
+            if [[ "$bval" == "0" || "$bval" == "" || "$bval" == "false" ]]; then
+                echo "false"
+            else
+                echo "true"
+            fi
+            ;;
+        not)
+            # not(value) — returns logical negation of a boolean value
+            if [[ $# -ne 1 ]]; then
+                echo "Error: not() requires exactly one argument" >&2
+                exit 1
+            fi
+            if [[ "$1" == "true" ]]; then
+                echo "false"
+            else
+                echo "true"
+            fi
+            ;;
+        true)
+            # true() — returns "true"
+            if [[ $# -gt 0 ]]; then
+                echo "Error: true() takes no arguments" >&2
+                exit 1
+            fi
+            echo "true"
+            ;;
+        false)
+            # false() — returns "false"
+            if [[ $# -gt 0 ]]; then
+                echo "Error: false() takes no arguments" >&2
+                exit 1
+            fi
+            echo "false"
+            ;;
+
+        # --- Node functions (Req 6.5) ---
+        name)
+            # name(node_path) — returns the basename of the node path
+            if [[ $# -ne 1 ]]; then
+                echo "Error: name() requires exactly one argument" >&2
+                exit 1
+            fi
+            echo "${1##*/}"
+            ;;
+        node)
+            # node() — node type test that matches any node; returns "true"
+            if [[ $# -gt 0 ]]; then
+                echo "Error: node() takes no arguments" >&2
+                exit 1
+            fi
+            echo "true"
+            ;;
+
+        *)
+            echo "Error: unsupported function '$func_name'" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# --- Predicate Engine (Task 8) ---
+
+# _resolve_attr_value(attr_name, node_path) -> outputs the attribute value
+#   Maps an XPath attribute name (without @) to the corresponding cache array.
+_resolve_attr_value() {
+    local attr_name="$1"
+    local node_path="$2"
+
+    # Ensure attributes are loaded
+    get_attributes "$node_path"
+
+    case "$attr_name" in
+        permissions)  echo "${ATTR_PERMISSIONS[$node_path]}" ;;
+        item-count)   echo "${ATTR_ITEM_COUNT[$node_path]}" ;;
+        group)        echo "${ATTR_GROUP[$node_path]}" ;;
+        user)         echo "${ATTR_USER[$node_path]}" ;;
+        size)         echo "${ATTR_SIZE[$node_path]}" ;;
+        datetime)     echo "${ATTR_DATETIME[$node_path]}" ;;
+        name)         echo "${ATTR_NAME[$node_path]}" ;;
+        type)         echo "${NODE_TYPE[$node_path]}" ;;
+        link-target)  echo "${ATTR_LINK_TARGET[$node_path]}" ;;
+        *)
+            echo "Error: unknown attribute '@$attr_name'" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# _eval_predicate_expr(expression, node_path, position, total) -> outputs a value
+#   Evaluates a predicate sub-expression and returns its value (a number, string,
+#   or "true"/"false"). This is used internally by eval_predicate to resolve
+#   function calls, attribute references, arithmetic, and literals.
+_eval_predicate_expr() {
+    local expr="$1"
+    local node_path="$2"
+    local position="$3"
+    local total="$4"
+
+    # Trim whitespace
+    expr="$(echo "$expr" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+    # --- Handle function calls: funcname(...) ---
+    # Match pattern: word-chars followed by (...)
+    if [[ "$expr" =~ ^([a-zA-Z_][a-zA-Z0-9_-]*)\((.*)?\)$ ]]; then
+        local func_name="${BASH_REMATCH[1]}"
+        local func_args_str="${BASH_REMATCH[2]}"
+
+        # Build argument list
+        local -a func_args=()
+        if [[ -n "$func_args_str" ]]; then
+            # Split arguments by comma (simple split, no nested function support needed here)
+            local IFS=','
+            local arg
+            for arg in $func_args_str; do
+                # Trim whitespace
+                arg="$(echo "$arg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                # If argument is an @attr reference, resolve it
+                if [[ "$arg" == @* ]]; then
+                    local attr_name="${arg:1}"
+                    arg="$(_resolve_attr_value "$attr_name" "$node_path")"
+                fi
+                # If argument is a quoted string, strip quotes
+                if [[ "$arg" =~ ^\'(.*)\'$ ]]; then
+                    arg="${BASH_REMATCH[1]}"
+                fi
+                func_args+=("$arg")
+            done
+        fi
+
+        call_function "$func_name" "$position" "$total" "${func_args[@]}"
+        return
+    fi
+
+    # --- Handle @attr reference ---
+    if [[ "$expr" == @* ]]; then
+        local attr_name="${expr:1}"
+        _resolve_attr_value "$attr_name" "$node_path"
+        return
+    fi
+
+    # --- Handle quoted string literal ---
+    if [[ "$expr" =~ ^\'(.*)\'$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return
+    fi
+
+    # --- Handle numeric literal ---
+    if _is_numeric "$expr"; then
+        echo "$expr"
+        return
+    fi
+
+    # --- Handle arithmetic expressions: e.g. last()-1, position()+1 ---
+    # Try to find an arithmetic operator (+, -, *, div, mod) between two sub-expressions.
+    # We look for operators that are NOT inside parentheses.
+    local paren_depth=0 ci best_op_pos=-1 best_op="" best_op_len=0
+    for (( ci=0; ci<${#expr}; ci++ )); do
+        local ch="${expr:$ci:1}"
+        if [[ "$ch" == "(" ]]; then
+            (( paren_depth++ ))
+        elif [[ "$ch" == ")" ]]; then
+            (( paren_depth-- ))
+        elif (( paren_depth == 0 )); then
+            # Check for multi-char operators first: div, mod
+            if (( ci + 3 <= ${#expr} )) && [[ "${expr:$ci:3}" == "div" ]]; then
+                best_op_pos=$ci; best_op="div"; best_op_len=3
+            elif (( ci + 3 <= ${#expr} )) && [[ "${expr:$ci:3}" == "mod" ]]; then
+                best_op_pos=$ci; best_op="mod"; best_op_len=3
+            elif [[ "$ch" == "+" ]]; then
+                best_op_pos=$ci; best_op="+"; best_op_len=1
+            elif [[ "$ch" == "-" ]]; then
+                # Only treat as operator if there's something before it (not unary minus)
+                if (( ci > 0 )); then
+                    local prev_char="${expr:$((ci-1)):1}"
+                    if [[ "$prev_char" == ")" || "$prev_char" =~ [0-9] ]]; then
+                        best_op_pos=$ci; best_op="-"; best_op_len=1
+                    fi
+                fi
+            elif [[ "$ch" == "*" ]]; then
+                best_op_pos=$ci; best_op="*"; best_op_len=1
+            fi
+        fi
+    done
+
+    if (( best_op_pos >= 0 )); then
+        local left_expr="${expr:0:$best_op_pos}"
+        local right_expr="${expr:$((best_op_pos + best_op_len))}"
+        local left_val right_val
+        left_val="$(_eval_predicate_expr "$left_expr" "$node_path" "$position" "$total")"
+        right_val="$(_eval_predicate_expr "$right_expr" "$node_path" "$position" "$total")"
+        eval_operator "$left_val" "$best_op" "$right_val"
+        return
+    fi
+
+    # --- Fallback: return the expression as-is (literal value) ---
+    echo "$expr"
+}
+
+# eval_predicate(expression, node_path, position, total) -> returns 0 (true) or 1 (false)
+#   expression: the predicate string (e.g., "@size>3500", "position()<3", "1")
+#   node_path: path of the node being tested
+#   position: 1-based position of node in current set
+#   total: total number of nodes in current set
+eval_predicate() {
+    local expression="$1"
+    local node_path="$2"
+    local position="$3"
+    local total="$4"
+
+    # Trim whitespace
+    expression="$(echo "$expression" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+    # --- Handle compound predicates: "expr1 and expr2", "expr1 or expr2" ---
+    # Split on " and " or " or " that are NOT inside brackets or parentheses.
+    local depth=0 i
+    local expr_len=${#expression}
+
+    # Check for " or " first (lower precedence)
+    for (( i=0; i<expr_len; i++ )); do
+        local ch="${expression:$i:1}"
+        if [[ "$ch" == "(" || "$ch" == "[" ]]; then
+            (( depth++ ))
+        elif [[ "$ch" == ")" || "$ch" == "]" ]]; then
+            (( depth-- ))
+        elif (( depth == 0 )); then
+            if (( i + 4 <= expr_len )) && [[ "${expression:$i:4}" == " or " ]]; then
+                local left_part="${expression:0:$i}"
+                local right_part="${expression:$((i+4))}"
+                local left_result right_result
+                if eval_predicate "$left_part" "$node_path" "$position" "$total"; then
+                    left_result="true"
+                else
+                    left_result="false"
+                fi
+                if eval_predicate "$right_part" "$node_path" "$position" "$total"; then
+                    right_result="true"
+                else
+                    right_result="false"
+                fi
+                local combined
+                combined="$(eval_operator "$left_result" "or" "$right_result")"
+                [[ "$combined" == "true" ]]
+                return $?
+            fi
+        fi
+    done
+
+    # Check for " and "
+    depth=0
+    for (( i=0; i<expr_len; i++ )); do
+        local ch="${expression:$i:1}"
+        if [[ "$ch" == "(" || "$ch" == "[" ]]; then
+            (( depth++ ))
+        elif [[ "$ch" == ")" || "$ch" == "]" ]]; then
+            (( depth-- ))
+        elif (( depth == 0 )); then
+            if (( i + 5 <= expr_len )) && [[ "${expression:$i:5}" == " and " ]]; then
+                local left_part="${expression:0:$i}"
+                local right_part="${expression:$((i+5))}"
+                local left_result right_result
+                if eval_predicate "$left_part" "$node_path" "$position" "$total"; then
+                    left_result="true"
+                else
+                    left_result="false"
+                fi
+                if eval_predicate "$right_part" "$node_path" "$position" "$total"; then
+                    right_result="true"
+                else
+                    right_result="false"
+                fi
+                local combined
+                combined="$(eval_operator "$left_result" "and" "$right_result")"
+                [[ "$combined" == "true" ]]
+                return $?
+            fi
+        fi
+    done
+
+    # --- Handle pure numeric literal: positional predicate [1], [3] ---
+    if _is_numeric "$expression"; then
+        [[ "$position" -eq "$expression" ]]
+        return $?
+    fi
+
+    # --- Handle comparison operators: find =, !=, <=, >=, <, > outside parens/quotes ---
+    # Scan for comparison operators not inside parentheses or single quotes
+    local cmp_op="" cmp_pos=-1 cmp_len=0
+    depth=0
+    local in_quote=0
+    for (( i=0; i<expr_len; i++ )); do
+        local ch="${expression:$i:1}"
+        if [[ "$ch" == "'" ]]; then
+            (( in_quote = 1 - in_quote ))
+        elif (( in_quote == 0 )); then
+            if [[ "$ch" == "(" ]]; then
+                (( depth++ ))
+            elif [[ "$ch" == ")" ]]; then
+                (( depth-- ))
+            elif (( depth == 0 )); then
+                # Check for multi-char operators first
+                if (( i + 2 <= expr_len )) && [[ "${expression:$i:2}" == "!=" ]]; then
+                    cmp_op="!="; cmp_pos=$i; cmp_len=2; break
+                elif (( i + 2 <= expr_len )) && [[ "${expression:$i:2}" == "<=" ]]; then
+                    cmp_op="<="; cmp_pos=$i; cmp_len=2; break
+                elif (( i + 2 <= expr_len )) && [[ "${expression:$i:2}" == ">=" ]]; then
+                    cmp_op=">="; cmp_pos=$i; cmp_len=2; break
+                elif [[ "$ch" == "=" ]]; then
+                    cmp_op="="; cmp_pos=$i; cmp_len=1; break
+                elif [[ "$ch" == "<" ]]; then
+                    cmp_op="<"; cmp_pos=$i; cmp_len=1; break
+                elif [[ "$ch" == ">" ]]; then
+                    cmp_op=">"; cmp_pos=$i; cmp_len=1; break
+                fi
+            fi
+        fi
+    done
+
+    if (( cmp_pos >= 0 )); then
+        local left_expr="${expression:0:$cmp_pos}"
+        local right_expr="${expression:$((cmp_pos + cmp_len))}"
+
+        # Evaluate both sides
+        local left_val right_val
+        left_val="$(_eval_predicate_expr "$left_expr" "$node_path" "$position" "$total")"
+        right_val="$(_eval_predicate_expr "$right_expr" "$node_path" "$position" "$total")"
+
+        local result
+        result="$(eval_operator "$left_val" "$cmp_op" "$right_val")"
+        [[ "$result" == "true" ]]
+        return $?
+    fi
+
+    # --- Handle attribute existence: @attr (no operator) ---
+    if [[ "$expression" == @* ]]; then
+        local attr_name="${expression:1}"
+        get_attributes "$node_path"
+        local attr_val
+        attr_val="$(_resolve_attr_value "$attr_name" "$node_path")"
+        [[ -n "$attr_val" ]]
+        return $?
+    fi
+
+    # --- Handle function-based predicates that return a number (positional) ---
+    # e.g., last()-1, position(), last()
+    # Evaluate the expression and check if it's a number (positional) or boolean
+    local eval_result
+    eval_result="$(_eval_predicate_expr "$expression" "$node_path" "$position" "$total")"
+
+    if [[ "$eval_result" == "true" ]]; then
+        return 0
+    elif [[ "$eval_result" == "false" ]]; then
+        return 1
+    elif _is_numeric "$eval_result"; then
+        # Treat as positional predicate: compare position to the evaluated number
+        [[ "$position" -eq "$eval_result" ]]
+        return $?
+    fi
+
+    # If we get here, the predicate is not recognized
+    echo "Error: unsupported predicate expression '$expression'" >&2
+    exit 1
+}
+
+# --- Query Evaluator (Task 9) ---
+
+# evaluate()
+#   Main evaluation entry point. Reads the global AST arrays populated by
+#   parse_query() and walks the steps against the live file system.
+#   Handles union queries by evaluating each sub-query independently and
+#   merging results.
+#   Outputs matching node paths (or attribute values) to stdout, one per line.
+#   Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9
+evaluate() {
+    # --- Handle union queries (Req 3.8) ---
+    if (( UNION_COUNT > 1 )); then
+        local -A seen_results=()
+        local ui
+        for (( ui=0; ui<UNION_COUNT; ui++ )); do
+            local sub_query="${UNION_QUERIES[$ui]}"
+            # Re-parse for this sub-query
+            _parse_single_query "$sub_query"
+            # Evaluate the sub-query
+            local sub_results
+            sub_results="$(_evaluate_single_query)"
+            # Merge results, deduplicating
+            if [[ -n "$sub_results" ]]; then
+                local line
+                while IFS= read -r line; do
+                    if [[ -z "${seen_results[$line]+x}" ]]; then
+                        seen_results["$line"]=1
+                        echo "$line"
+                    fi
+                done <<< "$sub_results"
+            fi
+        done
+        return
+    fi
+
+    # Single query (no union) — evaluate directly
+    _evaluate_single_query
+}
+
+# _evaluate_single_query()
+#   Evaluates the current AST (STEPS, STEP_AXES, PREDICATES, QUERY_TYPE,
+#   STEP_COUNT) against the file system and outputs results.
+_evaluate_single_query() {
+    # --- Set initial context (Req 3.1, 3.2) ---
+    local -a context_nodes=()
+    if [[ "$QUERY_TYPE" == "absolute" ]]; then
+        context_nodes=("/")
+    else
+        context_nodes=("$PWD")
+    fi
+
+    # Handle bare "/" query — just return root
+    if (( STEP_COUNT == 1 )) && [[ -z "${STEPS[0]}" && "${STEP_AXES[0]}" == "child" ]]; then
+        echo "/"
+        return
+    fi
+
+    # --- Iterate through AST steps ---
+    local si
+    for (( si=0; si<STEP_COUNT; si++ )); do
+        local step_name="${STEPS[$si]}"
+        local axis="${STEP_AXES[$si]}"
+        local predicate="${PREDICATES[$si]}"
+
+        # Expand the context node set according to the axis
+        local -a new_context=()
+
+        # For attribute axis, we output values rather than paths
+        if [[ "$axis" == "attribute" ]]; then
+            _evaluate_attribute_step "$step_name" "${context_nodes[@]}"
+            return
+        fi
+
+        local ctx_node
+        for ctx_node in "${context_nodes[@]}"; do
+            local -a expanded=()
+            expanded=( $(evaluate_step "$step_name" "$axis" "$ctx_node") )
+            new_context+=("${expanded[@]}")
+        done
+
+        # --- Apply predicates if present (Req 3.7) ---
+        if [[ -n "$predicate" ]]; then
+            local -a filtered=()
+            local total=${#new_context[@]}
+            local pos
+            for (( pos=0; pos<total; pos++ )); do
+                local node="${new_context[$pos]}"
+                local one_based_pos=$(( pos + 1 ))
+                if eval_predicate "$predicate" "$node" "$one_based_pos" "$total"; then
+                    filtered+=("$node")
+                fi
+            done
+            new_context=("${filtered[@]}")
+        fi
+
+        context_nodes=("${new_context[@]}")
+
+        # If context is empty, short-circuit (Req 3.9)
+        if (( ${#context_nodes[@]} == 0 )); then
+            return
+        fi
+    done
+
+    # Output results
+    local node
+    for node in "${context_nodes[@]}"; do
+        echo "$node"
+    done
+}
+
+# evaluate_step(step_name, axis, context_node)
+#   Resolves a single path step for one context node.
+#   Outputs matching node paths, one per line.
+#   Requirements: 3.3, 3.4, 3.5, 3.6, 7.1, 7.3, 7.4
+evaluate_step() {
+    local step_name="$1"
+    local axis="$2"
+    local ctx_node="$3"
+
+    case "$axis" in
+        child)
+            # Req 3.3: expand to direct children matching step name
+            _evaluate_child_step "$step_name" "$ctx_node"
+            ;;
+        descendant)
+            # Req 3.4: expand to all descendants matching step name
+            _evaluate_descendant_step "$step_name" "$ctx_node"
+            ;;
+        parent)
+            # Req 3.5: replace with parent directory
+            _evaluate_parent_step "$ctx_node"
+            ;;
+        self)
+            # Req 3.6: keep unchanged
+            echo "$ctx_node"
+            ;;
+        *)
+            echo "Error: unsupported axis '$axis'" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# _evaluate_child_step(step_name, context_node)
+#   Lists direct children of context_node and filters by step_name.
+#   Wildcards: * matches all, node() matches all.
+#   Req 3.3, 7.1, 7.3
+_evaluate_child_step() {
+    local step_name="$1"
+    local ctx_node="$2"
+
+    local norm
+    norm="$(normalize_path "$ctx_node")"
+
+    # Only directories have children
+    if [[ ! -d "$norm" ]]; then
+        return
+    fi
+
+    local children
+    children="$(list_children "$norm")"
+    if [[ -z "$children" ]]; then
+        return
+    fi
+
+    local child
+    while IFS= read -r child; do
+        [[ -z "$child" ]] && continue
+        local child_base
+        child_base="$(basename "$child")"
+
+        if [[ "$step_name" == "*" || "$step_name" == "node()" ]]; then
+            # Wildcard: match all children (Req 7.1, 7.3)
+            echo "$child"
+        elif [[ "$child_base" == "$step_name" ]]; then
+            # Exact name match
+            echo "$child"
+        fi
+    done <<< "$children"
+}
+
+# _evaluate_descendant_step(step_name, context_node)
+#   Searches all descendants of context_node matching step_name.
+#   Wildcards: * matches all, node() matches all.
+#   Req 3.4, 7.4
+_evaluate_descendant_step() {
+    local step_name="$1"
+    local ctx_node="$2"
+
+    local norm
+    norm="$(normalize_path "$ctx_node")"
+
+    local search_pattern="$step_name"
+    if [[ "$step_name" == "node()" ]]; then
+        search_pattern="*"
+    fi
+
+    local results
+    results="$(search_descendants "$search_pattern" "$norm")"
+    if [[ -n "$results" ]]; then
+        echo "$results"
+    fi
+}
+
+# _evaluate_parent_step(context_node)
+#   Returns the parent directory of the context node.
+#   Req 3.5
+_evaluate_parent_step() {
+    local ctx_node="$1"
+
+    local norm
+    norm="$(normalize_path "$ctx_node")"
+
+    # Root has no parent above itself
+    if [[ "$norm" == "/" ]]; then
+        echo "/"
+        return
+    fi
+
+    local parent
+    parent="$(dirname "$norm")"
+    echo "$parent"
+}
+
+# _evaluate_attribute_step(attr_name, context_nodes...)
+#   Retrieves attribute values for the context nodes.
+#   For a specific attribute: outputs the value.
+#   For @* wildcard: outputs all attributes in key=value format.
+#   Req 7.2, 9.2, 9.3
+_evaluate_attribute_step() {
+    local attr_name="$1"
+    shift
+    local -a ctx_nodes=("$@")
+
+    local node
+    for node in "${ctx_nodes[@]}"; do
+        local norm
+        norm="$(normalize_path "$node")"
+        get_attributes "$norm"
+
+        if [[ "$attr_name" == "*" ]]; then
+            # @* — output all attributes in key=value format (Req 7.2)
+            echo "permissions=${ATTR_PERMISSIONS[$norm]}"
+            echo "item-count=${ATTR_ITEM_COUNT[$norm]}"
+            echo "group=${ATTR_GROUP[$norm]}"
+            echo "user=${ATTR_USER[$norm]}"
+            echo "size=${ATTR_SIZE[$norm]}"
+            echo "datetime=${ATTR_DATETIME[$norm]}"
+            echo "name=${ATTR_NAME[$norm]}"
+            echo "type=${NODE_TYPE[$norm]}"
+        else
+            # Specific attribute — output just the value (Req 9.2)
+            _resolve_attr_value "$attr_name" "$norm"
+        fi
+    done
+}
+
+# --- Result Formatter (Task 10) ---
+# format_results(raw_output, last_axis, last_step_name)
+#   Formats the raw evaluation output for final display to stdout.
+#   - Node selections: one full path per line
+#   - Single attribute (@attr): attribute value(s)
+#   - All-attribute (@*): key=value format (already produced by evaluator)
+#   - Empty result set: no output, exit 0
+#   Requirements: 9.1, 9.2, 9.3, 9.4
+format_results() {
+    local raw_output="$1"
+
+    # Empty result set — no output (Req 9.4)
+    if [[ -z "$raw_output" ]]; then
+        return
+    fi
+
+    # Output the results as-is. The evaluator already produces:
+    #   - Full paths (one per line) for node selections (Req 9.1)
+    #   - Attribute values for single @attr selections (Req 9.2)
+    #   - key=value lines for @* selections (Req 9.3)
+    printf '%s\n' "$raw_output"
+}
+
+# ===========================================================================
+# Main entry point (Task 11)
+# ===========================================================================
+main() {
+    # Step 1: Sanitize input to prevent command injection (Req 11.1)
+    local sanitized
+    sanitized="$(sanitize_input "$QUERY_STRING")"
+
+    # Step 2: Parse the query into the global AST arrays (Req 10.1, 10.4)
+    # parse_query exits 1 on syntax errors / unsupported constructs
+    parse_query "$sanitized"
+
+    # Step 3: Evaluate the AST against the live file system (Req 10.2, 10.3)
+    # evaluate outputs matching paths/values to stdout.
+    # Permission denied warnings are printed to stderr by the adapter;
+    # evaluation continues with accessible paths (Req 10.3).
+    # Note: evaluate may exit 1 inside the subshell for predicate/function
+    # errors — we detect that via the exit status and propagate it.
+    local raw_output
+    local eval_rc=0
+    raw_output="$(evaluate)" || eval_rc=$?
+    if (( eval_rc != 0 )); then
+        exit 1
+    fi
+
+    # Step 4: Format and output results (Req 9.1–9.4)
+    format_results "$raw_output"
+
+    # Exit 0 for success or empty results (Req 10.2)
+    exit 0
+}
+
+main "$@"
